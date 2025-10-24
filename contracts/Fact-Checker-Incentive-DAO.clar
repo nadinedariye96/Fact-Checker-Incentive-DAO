@@ -33,6 +33,8 @@
     created-at: uint,
     votes-for: uint,
     votes-against: uint,
+    weighted-votes-for: uint,
+    weighted-votes-against: uint,
     total-voters: uint,
     resolved-at: (optional uint)
   }
@@ -94,6 +96,8 @@
         created-at: current-height,
         votes-for: u0,
         votes-against: u0,
+        weighted-votes-for: u0,
+        weighted-votes-against: u0,
         total-voters: u0,
         resolved-at: none
       }
@@ -110,6 +114,8 @@
       (claim (unwrap! (map-get? claims { claim-id: claim-id }) err-not-found))
       (current-height stacks-block-height)
       (voting-deadline (+ (get created-at claim) voting-period))
+      (voter-rep (get-user-reputation tx-sender))
+      (weighted-amount (calculate-weighted-vote stake-amount (get score voter-rep)))
     )
     (asserts! (< current-height voting-deadline) err-claim-expired)
     (asserts! (>= stake-amount u10) err-insufficient-stake)
@@ -129,6 +135,8 @@
       (merge claim {
         votes-for: (if support (+ (get votes-for claim) stake-amount) (get votes-for claim)),
         votes-against: (if support (get votes-against claim) (+ (get votes-against claim) stake-amount)),
+        weighted-votes-for: (if support (+ (get weighted-votes-for claim) weighted-amount) (get weighted-votes-for claim)),
+        weighted-votes-against: (if support (get weighted-votes-against claim) (+ (get weighted-votes-against claim) weighted-amount)),
         total-voters: (+ (get total-voters claim) u1)
       })
     )
@@ -145,7 +153,9 @@
       (voting-deadline (+ (get created-at claim) voting-period))
       (votes-for (get votes-for claim))
       (votes-against (get votes-against claim))
-      (is-approved (> votes-for votes-against))
+      (weighted-for (get weighted-votes-for claim))
+      (weighted-against (get weighted-votes-against claim))
+      (is-approved (> weighted-for weighted-against))
     )
     (asserts! (>= current-height voting-deadline) err-invalid-vote)
     (asserts! (is-eq (get status claim) "pending") err-invalid-vote)
@@ -280,6 +290,17 @@
 
 (define-read-only (get-treasury-balance)
   (var-get treasury-balance)
+)
+
+(define-read-only (calculate-weighted-vote (stake-amount uint) (reputation-score uint))
+  (let
+    (
+      (base-multiplier u100)
+      (reputation-multiplier (if (> reputation-score u0) (+ u100 reputation-score) u100))
+      (weighted-stake (/ (* stake-amount reputation-multiplier) base-multiplier))
+    )
+    weighted-stake
+  )
 )
 
 (define-private (update-reputation (user principal) (accurate bool))
