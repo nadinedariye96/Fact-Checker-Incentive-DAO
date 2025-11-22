@@ -68,6 +68,31 @@
   { balance: uint }
 )
 
+(define-map user-statistics
+  { user: principal }
+  {
+    claims-submitted: uint,
+    claims-approved: uint,
+    claims-rejected: uint,
+    total-votes-cast: uint,
+    total-stake-earned: uint,
+    total-stake-lost: uint,
+    disputes-initiated: uint,
+    disputes-won: uint,
+    last-activity: uint
+  }
+)
+
+(define-map claim-metadata
+  { claim-id: uint }
+  {
+    final-verdict: bool,
+    total-rewards-distributed: uint,
+    participation-count: uint,
+    controversy-score: uint
+  }
+)
+
 (define-public (initialize)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -104,6 +129,7 @@
     )
     (var-set next-claim-id (+ claim-id u1))
     (var-set total-claims (+ (var-get total-claims) u1))
+    (unwrap-panic (update-user-statistics tx-sender "claims-submitted" u1))
     (ok claim-id)
   )
 )
@@ -141,6 +167,7 @@
       })
     )
     
+    (unwrap-panic (update-user-statistics tx-sender "votes-cast" u1))
     (ok true)
   )
 )
@@ -173,11 +200,16 @@
         (begin
           (try! (as-contract (ft-transfer? fact-token base-reward tx-sender (get submitter claim))))
           (unwrap-panic (update-reputation (get submitter claim) true))
+          (unwrap-panic (update-user-statistics (get submitter claim) "claims-approved" u1))
         )
-        (unwrap-panic (update-reputation (get submitter claim) false))
+        (begin
+          (unwrap-panic (update-reputation (get submitter claim) false))
+          (unwrap-panic (update-user-statistics (get submitter claim) "claims-rejected" u1))
+        )
       )
       
       (unwrap-panic (distribute-rewards claim-id))
+      (unwrap-panic (record-claim-metadata claim-id is-approved base-reward (get total-voters claim)))
       (ok is-approved)
     )
   )
@@ -210,6 +242,7 @@
     )
     
     (var-set next-dispute-id (+ dispute-id u1))
+    (unwrap-panic (update-user-statistics tx-sender "dispute-initiated" u1))
     (ok dispute-id)
   )
 )
@@ -234,7 +267,10 @@
     
     (begin
       (if resolution
-        (try! (as-contract (ft-transfer? fact-token (get challenger-stake dispute) tx-sender (get challenger dispute))))
+        (begin
+          (try! (as-contract (ft-transfer? fact-token (get challenger-stake dispute) tx-sender (get challenger dispute))))
+          (unwrap-panic (update-user-statistics (get challenger dispute) "dispute-won" u1))
+        )
         (begin
           (try! (as-contract (ft-transfer? fact-token (/ (get challenger-stake dispute) u2) tx-sender contract-owner)))
           (unwrap-panic (update-reputation (get challenger dispute) false))
@@ -292,6 +328,52 @@
   (var-get treasury-balance)
 )
 
+(define-read-only (get-user-statistics (user principal))
+  (default-to
+    {
+      claims-submitted: u0,
+      claims-approved: u0,
+      claims-rejected: u0,
+      total-votes-cast: u0,
+      total-stake-earned: u0,
+      total-stake-lost: u0,
+      disputes-initiated: u0,
+      disputes-won: u0,
+      last-activity: u0
+    }
+    (map-get? user-statistics { user: user })
+  )
+)
+
+(define-read-only (get-claim-metadata (claim-id uint))
+  (map-get? claim-metadata { claim-id: claim-id })
+)
+
+(define-read-only (calculate-user-success-rate (user principal))
+  (let
+    (
+      (stats (get-user-statistics user))
+      (user-total-claims (+ (get claims-approved stats) (get claims-rejected stats)))
+    )
+    (if (> user-total-claims u0)
+      (/ (* (get claims-approved stats) u100) user-total-claims)
+      u0
+    )
+  )
+)
+
+(define-read-only (calculate-net-stake (user principal))
+  (let
+    (
+      (stats (get-user-statistics user))
+    )
+    (if (>= (get total-stake-earned stats) (get total-stake-lost stats))
+      (- (get total-stake-earned stats) (get total-stake-lost stats))
+      u0
+    )
+  )
+)
+
 (define-read-only (calculate-weighted-vote (stake-amount uint) (reputation-score uint))
   (let
     (
@@ -334,6 +416,60 @@
     (if (> winning-stake u0)
       (var-set treasury-balance (- (var-get treasury-balance) reward-pool))
       true
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-user-statistics (user principal) (stat-type (string-ascii 20)) (value uint))
+  (let
+    (
+      (current-stats (get-user-statistics user))
+    )
+    (map-set user-statistics
+      { user: user }
+      {
+        claims-submitted: (if (is-eq stat-type "claims-submitted") (+ (get claims-submitted current-stats) value) (get claims-submitted current-stats)),
+        claims-approved: (if (is-eq stat-type "claims-approved") (+ (get claims-approved current-stats) value) (get claims-approved current-stats)),
+        claims-rejected: (if (is-eq stat-type "claims-rejected") (+ (get claims-rejected current-stats) value) (get claims-rejected current-stats)),
+        total-votes-cast: (if (is-eq stat-type "votes-cast") (+ (get total-votes-cast current-stats) value) (get total-votes-cast current-stats)),
+        total-stake-earned: (if (is-eq stat-type "stake-earned") (+ (get total-stake-earned current-stats) value) (get total-stake-earned current-stats)),
+        total-stake-lost: (if (is-eq stat-type "stake-lost") (+ (get total-stake-lost current-stats) value) (get total-stake-lost current-stats)),
+        disputes-initiated: (if (is-eq stat-type "dispute-initiated") (+ (get disputes-initiated current-stats) value) (get disputes-initiated current-stats)),
+        disputes-won: (if (is-eq stat-type "dispute-won") (+ (get disputes-won current-stats) value) (get disputes-won current-stats)),
+        last-activity: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (record-claim-metadata (claim-id uint) (verdict bool) (rewards uint) (participants uint))
+  (let
+    (
+      (claim (unwrap-panic (map-get? claims { claim-id: claim-id })))
+      (votes-for (get votes-for claim))
+      (votes-against (get votes-against claim))
+      (total-votes (+ votes-for votes-against))
+      (controversy (if (> total-votes u0)
+        (let
+          (
+            (smaller (if (< votes-for votes-against) votes-for votes-against))
+            (larger (if (> votes-for votes-against) votes-for votes-against))
+          )
+          (/ (* smaller u100) larger)
+        )
+        u0
+      ))
+    )
+    (map-set claim-metadata
+      { claim-id: claim-id }
+      {
+        final-verdict: verdict,
+        total-rewards-distributed: rewards,
+        participation-count: participants,
+        controversy-score: controversy
+      }
     )
     (ok true)
   )
